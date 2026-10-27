@@ -1,0 +1,67 @@
+{
+  "name": "dsh-ppt-master-plus",
+  "version": "6.7.3-r1",
+  "description": "DeepSeek Harness plugin wrapping upstream ppt-master v6.7.3: byte-for-byte vendored skills, Windows and POSIX runtime support, optional venv isolation and a Plugins-page configuration card.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "skill",
+    "ppt-master",
+    "pptx",
+    "presentation",
+    "venv",
+    "windows",
+    "python-venv"
+  ],
+  "homepage": "https://github.com/AlbertZJ/dsh-ppt-master-plus#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AlbertZJ/dsh-ppt-master-plus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AlbertZJ/dsh-ppt-master-plus/issues"
+  },
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib",
+    "skills",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "NOTICE",
+    "static",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.1-rc.1"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ],
+      "external": [
+        "react"
+      ]
+    }
+  }
+}

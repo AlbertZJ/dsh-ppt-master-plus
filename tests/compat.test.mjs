@@ -1,0 +1,850 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { cp, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join } from 'node:path';
+
+import { PLUGIN_ENTRY, resolveDshModules, runCompatCheck } from '../scripts/check-dsh-compat.mjs';
+import { SKILL_RANK } from '../lib/skill-provider.js';
+import { makeStubSdk } from './helpers/stub-sdk.mjs';
+
+/**
+ * Task 9 契约：check-dsh-compat.mjs（五级定位 + SDK 契约 + rank 漂移检出）。
+ *
+ * 覆盖面——
+ * - resolveDshModules 有序五级（explicit > DSH_NODE_MODULES > DSH_PROFILE_DIR >
+ *   DSH_HOME/profiles/$DSH_PROFILE > DSH_HOME/profiles）逐级断言；命中即用（前级
+ *   命中不再探测后级、不报多候选）；第五级不存在时回落无序扫描
+ *   $DSH_HOME/profiles/<star>/node_modules（>1 → throw 列候选；恰 1 → 用之；
+ *   0 → 全失败 throw）；env 无 DSH_HOME（且无前级命中）→ throw。
+ * - runCompatCheck 主流程经注入 stub SDK（临时 .mjs 文件：fake
+ *   SkillRegistry/ToolRuntime/BUNDLED_SKILL_RANK=600 等）驱动全分支：基线全绿、
+ *   rank 相对关系失败、漂移（注入期望 rank=550 + stub superpowers-dsh 常量 600 →
+ *   告警且非零退出）、superpowers-dsh 读不到 → warning 降级、register 拒绝手写
+ *   定义 → §3.5 defineTool 回退。
+ * - 挂载入口 = 本插件根 index.js（显式断言路径含 /index.js 且非 lib/index.js）；
+ *   驱动经 apply(ctx, { skillRoots: [fixture] }) 注入通道（T14 前 skills/ 不存在）。
+ * - stub 的 registerProvider/register 断言方法形态调用（cordis traceable 层脱挂
+ *   调用 this=undefined——真实 SDK 实测契约，防 index.js 提取式调用回归）。
+ * - CLI：--dsh-modules/--skill-roots（逗号多根）、定位失败 exit 1、漂移 exit 1。
+ *
+ * Task 5 追加面（本文件为**回归面**，一律按测试名定位）：
+ * - 插件入口装载期需宿主 `@deepseek-ai/schemastery`（index.js 受控解析）——stub 树
+ *   内新增 schemastery 替身包（`SCHEMASTERY_STUB`，包形 `main→.cjs`，替身 4 层保真），
+ *   三个 stub CLI 例向其子进程注入 `DSH_NODE_MODULES=<stub 树>/node_modules`
+ *   （`resolveDshModules` 定位链第②级已支持）；两例保真例**保持 `{env:{}}` 不注入**
+ *   （`CLI: 无 --dsh-modules 且 env 无定位线索 → exit 1 报无法定位` 断言取
+ *   `error.stdout`；`CLI: 未知参数 → exit 1 usage 提示` 的装载期语义见 Task 5 报告）。
+ * - 新增「可解析/不可解析」两态子进程观测量（Env 清空 + 仍传 `--dsh-modules` →
+ *   装载期 fail-loud 命中 `@deepseek-ai/schemastery` 且非零退出）——fail-loud 语义的
+ *   唯一可观测面（spec §6.1⓪）。
+ *
+ * Task 10 追加面（§7.7 五项设计成立性前置检查，一律**追加**、不弱化既有基线）：
+ * - compat 输出须含五项断言行（`§7.7①`–`§7.7⑤`）：① Config volatile（`ns.Config`
+ *   + `toJSON()` 引用图内 volatile 恰 3 且另含非 volatile 叶）、② apply 第二参注入
+ *   通道实跑、③ bundle insert 层静态源码文本断言、④ schemastery 受控解析通道
+ *   （静态文本 + 实跑装载）、⑤ 生产根形态经真实 SkillRegistry 读回 `ppt-master-env`
+ *   （可 `get()`、`content` 非空）。载体分工钉死：③④＝静态源码文本断言，①②⑤＝实跑；
+ *   **不采用 env 通道子进程**。
+ * - 默认值交叉锚定（携入自 Task 5 审查）：schema 校验默认值 ≡ 注入袋缺省默认值。
+ * - 三条既有基线按测试名原样保留（`problems`/`warnings` 空集与两条 CLI stdout）。
+ */
+
+
+const fixturesDir = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
+const skillsFixtureRoot = join(fixturesDir, 'skills-fixture');
+const scriptPath = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'check-dsh-compat.mjs');
+const execFileAsync = promisify(execFile);
+
+const someProblem = (result, pattern) => result.problems.some((entry) => pattern.test(entry));
+const someWarning = (result, pattern) => result.warnings.some((entry) => pattern.test(entry));
+
+/** 造一个临时目录树骨架。 */
+async function makeTree(prefix) {
+  const base = await mkdtemp(join(tmpdir(), prefix));
+  return { base, cleanup: () => rm(base, { recursive: true, force: true }) };
+}
+
+/**
+ * 造一个「真 SDK 安装形态」的 node_modules 夹具（M10 判据：命中须含 @deepseek-ai
+ * 子目录——裸空 node_modules 不再构成命中）。仅替换原裸 mkdir 的建目录方式。
+ */
+async function mkSdkModules(dir) {
+  await mkdir(dir, { recursive: true });
+  await mkdir(join(dir, '@deepseek-ai'), { recursive: true });
+}
+
+/**
+ * T3 skills-fixture 的正例子集（剔除 broken——完整根含 broken/ 会触发 provider
+ * fail-loud，不适合作 compat 全绿基线）：只拷贝 alpha 的临时树。
+ */
+async function makePositiveFixture() {
+  const tree = await makeTree('compat-alpha-');
+  const root = join(tree.base, 'skills');
+  await cp(join(skillsFixtureRoot, 'alpha'), join(root, 'alpha'), { recursive: true });
+  return { ...tree, root };
+}
+
+// ─── resolveDshModules：有序五级逐级断言 ─────────────────────────
+
+test('resolveDshModules: ① explicit 参数命中 → via explicit（env 其余各级也存在仍让位）', async () => {
+  const tree = await makeTree('compat-l1-');
+  try {
+    const explicit = join(tree.base, 'explicit-nm');
+    const level2 = join(tree.base, 'env-nm');
+    const profileDir = join(tree.base, 'profile');
+    const home = join(tree.base, 'home');
+    for (const dir of [explicit, level2, join(profileDir, 'node_modules'), join(home, 'profiles', 'web', 'node_modules'), join(home, 'profiles', 'node_modules')]) {
+      await mkSdkModules(dir);
+    }
+    const resolved = resolveDshModules(explicit, {
+      DSH_NODE_MODULES: level2,
+      DSH_PROFILE_DIR: profileDir,
+      DSH_HOME: home,
+      DSH_PROFILE: 'web',
+    });
+    assert.equal(resolved.path, explicit);
+    assert.equal(resolved.via, 'explicit');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: ② DSH_NODE_MODULES 命中 → via DSH_NODE_MODULES（③④⑤存在仍让位，不报多候选）', async () => {
+  const tree = await makeTree('compat-l2-');
+  try {
+    const level2 = join(tree.base, 'env-nm');
+    const profileDir = join(tree.base, 'profile');
+    const home = join(tree.base, 'home');
+    for (const dir of [level2, join(profileDir, 'node_modules'), join(home, 'profiles', 'web', 'node_modules'), join(home, 'profiles', 'node_modules')]) {
+      await mkSdkModules(dir);
+    }
+    const resolved = resolveDshModules(undefined, {
+      DSH_NODE_MODULES: level2,
+      DSH_PROFILE_DIR: profileDir,
+      DSH_HOME: home,
+      DSH_PROFILE: 'web',
+    });
+    assert.equal(resolved.path, level2);
+    assert.equal(resolved.via, 'DSH_NODE_MODULES');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: ② 空串或不存在 → 探测后级（env 空值视为未设置）', async () => {
+  const tree = await makeTree('compat-l2miss-');
+  try {
+    const profileDir = join(tree.base, 'profile');
+    await mkSdkModules(join(profileDir, 'node_modules'));
+    for (const emptyish of ['', join(tree.base, 'no-such')]) {
+      const resolved = resolveDshModules(undefined, {
+        DSH_NODE_MODULES: emptyish,
+        DSH_PROFILE_DIR: profileDir,
+      });
+      assert.equal(resolved.via, 'DSH_PROFILE_DIR', `DSH_NODE_MODULES=${JSON.stringify(emptyish)} 不构成命中`);
+    }
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: ③ DSH_PROFILE_DIR/node_modules 命中 → via DSH_PROFILE_DIR', async () => {
+  const tree = await makeTree('compat-l3-');
+  try {
+    const profileDir = join(tree.base, 'profile');
+    await mkSdkModules(join(profileDir, 'node_modules'));
+    const resolved = resolveDshModules(undefined, { DSH_PROFILE_DIR: profileDir });
+    assert.equal(resolved.path, join(profileDir, 'node_modules'));
+    assert.equal(resolved.via, 'DSH_PROFILE_DIR');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: ④ DSH_HOME/profiles/$DSH_PROFILE/node_modules 命中 → via DSH_HOME/DSH_PROFILE', async () => {
+  const tree = await makeTree('compat-l4-');
+  try {
+    const home = join(tree.base, 'home');
+    await mkSdkModules(join(home, 'profiles', 'web', 'node_modules'));
+    const resolved = resolveDshModules(undefined, { DSH_HOME: home, DSH_PROFILE: 'web' });
+    assert.equal(resolved.path, join(home, 'profiles', 'web', 'node_modules'));
+    assert.equal(resolved.via, 'DSH_HOME/DSH_PROFILE');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: ④ DSH_PROFILE 缺失时该级跳过（不拼出 undefined 段）', async () => {
+  const tree = await makeTree('compat-l4miss-');
+  try {
+    const home = join(tree.base, 'home');
+    await mkSdkModules(join(home, 'profiles', 'web', 'node_modules'));
+    await mkSdkModules(join(home, 'profiles', 'node_modules'));
+    const resolved = resolveDshModules(undefined, { DSH_HOME: home });
+    assert.equal(resolved.via, 'DSH_HOME/profiles', '无 DSH_PROFILE → 第④级不可构成，第⑤级命中');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: ⑤ DSH_HOME/profiles/node_modules 命中 → via DSH_HOME/profiles（不再进入扫描）', async () => {
+  const tree = await makeTree('compat-l5-');
+  try {
+    const home = join(tree.base, 'home');
+    await mkSdkModules(join(home, 'profiles', 'node_modules'));
+    // 一个孤立 profile 也存在——第五级命中即用，轮不到无序扫描报多候选
+    await mkSdkModules(join(home, 'profiles', 'p1', 'node_modules'));
+    const resolved = resolveDshModules(undefined, { DSH_HOME: home });
+    assert.equal(resolved.path, join(home, 'profiles', 'node_modules'));
+    assert.equal(resolved.via, 'DSH_HOME/profiles');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: 有序命中即用——③④⑤同时存在时第③级胜出（优先级即消歧，不报多候选）', async () => {
+  const tree = await makeTree('compat-order-');
+  try {
+    const profileDir = join(tree.base, 'profile');
+    const home = join(tree.base, 'home');
+    for (const dir of [join(profileDir, 'node_modules'), join(home, 'profiles', 'web', 'node_modules'), join(home, 'profiles', 'node_modules')]) {
+      await mkSdkModules(dir);
+    }
+    const resolved = resolveDshModules(undefined, {
+      DSH_PROFILE_DIR: profileDir,
+      DSH_HOME: home,
+      DSH_PROFILE: 'web',
+    });
+    assert.equal(resolved.via, 'DSH_PROFILE_DIR');
+    assert.equal(resolved.path, join(profileDir, 'node_modules'));
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+// ─── resolveDshModules：无序扫描（第五级失败后唯一回落入口）──────
+
+test('resolveDshModules: 无序扫描 >1 命中 → throw 列出全部候选要求显式指定', async () => {
+  const tree = await makeTree('compat-scan-multi-');
+  try {
+    const home = join(tree.base, 'home');
+    const first = join(home, 'profiles', 'p1', 'node_modules');
+    const second = join(home, 'profiles', 'p2', 'node_modules');
+    for (const dir of [first, second]) await mkSdkModules(dir);
+    assert.throws(
+      () => resolveDshModules(undefined, { DSH_HOME: home }),
+      (error) => {
+        assert.match(error.message, /多个|候选/);
+        assert.ok(error.message.includes(first), '候选列表含 p1');
+        assert.ok(error.message.includes(second), '候选列表含 p2');
+        assert.match(error.message, /--dsh-modules|显式/);
+        return true;
+      },
+    );
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: 无序扫描恰 1 命中 → 用之（via scan）', async () => {
+  const tree = await makeTree('compat-scan-one-');
+  try {
+    const home = join(tree.base, 'home');
+    const only = join(home, 'profiles', 'only-one', 'node_modules');
+    await mkSdkModules(only);
+    const resolved = resolveDshModules(undefined, { DSH_HOME: home });
+    assert.equal(resolved.path, only);
+    assert.equal(resolved.via, 'scan');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: 五级全失败且扫描 0 命中 → throw（全失败报错）', async () => {
+  const tree = await makeTree('compat-scan-zero-');
+  try {
+    const home = join(tree.base, 'home');
+    await mkdir(join(home, 'profiles', 'empty-profile'), { recursive: true });
+    assert.throws(() => resolveDshModules(undefined, { DSH_HOME: home }), /无法定位/);
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+test('resolveDshModules: env 无 DSH_HOME（且无前级命中）→ throw 指明缺 DSH_HOME', () => {
+  assert.throws(() => resolveDshModules(undefined, {}), /DSH_HOME/);
+});
+
+test('resolveDshModules: env 无 DSH_HOME 但 explicit 命中 → 正常返回（前级命中无需 DSH_HOME）', async () => {
+  const tree = await makeTree('compat-nohome-');
+  try {
+    const explicit = join(tree.base, 'nm');
+    await mkSdkModules(explicit);
+    const resolved = resolveDshModules(explicit, {});
+    assert.equal(resolved.via, 'explicit');
+  } finally {
+    await tree.cleanup();
+  }
+});
+
+// ─── 挂载入口断言：插件根 index.js，非参考实现的 lib/index.js ────
+
+test('挂载入口 = 本插件根 index.js（路径含 /index.js、非 lib/index.js、真实存在）', () => {
+  assert.equal(PLUGIN_ENTRY.endsWith(join('index.js')), true, `入口以 index.js 结尾: ${PLUGIN_ENTRY}`);
+  assert.ok(!PLUGIN_ENTRY.includes(join('lib', 'index.js')), '不得挂载参考实现的 lib/index.js');
+  // 期望入口自 scriptPath 推导（脚本目录的父目录 = 仓库根），零硬编码——任意
+  // checkout 路径下同判（文件头的机器无关性声明）。
+  const expectedEntry = join(dirname(dirname(scriptPath)), 'index.js');
+  assert.equal(PLUGIN_ENTRY, expectedEntry, `入口必须位于本插件包根: ${PLUGIN_ENTRY} ≠ ${expectedEntry}`);
+});
+
+// ─── stub SDK 构造器（共享模块，issue #4）─────────────────────────
+// SCHEMASTERY_STUB / makeStubSdk 已迁至 tests/helpers/stub-sdk.mjs（单一事实源，
+// 另提供 CLI 形态供建 CI stub 树）；makeTree 仍留在本文件（其余 fixture 构造使用）。
+
+/**
+ * CLI 子进程「装载期可解析」env：`DSH_NODE_MODULES` 指向 stub 树的 node_modules
+ * （`resolveDshModules` 第②级；插件侧受控解析的 env 四级亦以本级为首）。
+ *
+ * 只服务 **index.js 装载期**的 schemastery 受控解析（该期插件无 explicit 参数可用），
+ * 故三个已传 `--dsh-modules` 的 stub CLI 例仍须注入；`--dsh-modules` 只服务 CLI 期的
+ * SDK 定位——两消费点各自独立，注入 env 不改变 stub 语义。前置断言替身确在树内，
+ * 防「本机侥幸绿」（不得改写为指向真实 node_modules 或按 realpath 推导）。
+ */
+function stubLoadEnv(sdk) {
+  const manifest = join(sdk.modules, '@deepseek-ai', 'schemastery', 'package.json');
+  assert.ok(existsSync(manifest), `stub 树须含 schemastery 替身（装载期受控解析面）: ${manifest}`);
+  return { DSH_NODE_MODULES: sdk.modules };
+}
+
+/** 读回 stub 模块的模块级日志（与脚本动态 import 同一 URL → 同一模块实例）。 */
+const stubModule = (modules, name, main = 'index.mjs') =>
+  import(pathToFileURL(join(modules, ...name.split('/'), main)).href);
+
+// ─── schemastery 替身保真（Task 5：替身自身的契约测试）────────────
+//
+// 替身是 Task 10①「Config volatile 声明存在」的**判定实现**：若替身不保真（例如把
+// 所有叶都标 volatile、或 toJSON 不产引用图），该断言会自我印证。故在此按真实包本机
+// 实测形态锁定替身 ②③④ 三层（层① 包形由 `pkg(main→.cjs)` 构造面保证）。
+
+test('stub schemastery 替身: 可调用 CJS 命名空间 + toJSON 引用图（volatile 恰 3 + 含非 volatile 叶）+ 二次 volatile 抛错 + 校验产 `.get()` 引用', async () => {
+  const sdk = await makeStubSdk();
+  try {
+    const ns = await stubModule(sdk.modules, '@deepseek-ai/schemastery', 'lib/index.cjs');
+    const z = ns.default;
+    assert.equal(typeof z, 'function', '真实包 module.exports = Schema（可调用命名空间）');
+    assert.equal('z' in z, false, '真实命名空间无 z 键（实测）');
+    for (const key of ['object', 'string', 'boolean', 'union', 'const']) {
+      assert.equal(typeof z[key], 'function', `命名空间须含 ${key}`);
+    }
+
+    // 与 index.js Config 同形：三叶子 volatile（含 union+const 枚举），另含非 volatile 叶。
+    const schema = z.object({
+      venv: z.object({
+        enabled: z.boolean().default(false).description('enabled').volatile(),
+        path: z.string().default('~/.ppt-master/venv').description('path').volatile(),
+        oldPathPolicy: z
+          .union([z.const('keep'), z.const('delete')])
+          .default('keep')
+          .description('policy')
+          .volatile(),
+      }).description('venv'),
+    }).description('root');
+
+    // 层④：按 schema 校验（schema({})）产出的 volatile 叶为带 .get() 的引用对象
+    const parsed = schema({});
+    assert.equal(typeof parsed.venv.enabled, 'object', 'volatile 叶为引用对象');
+    assert.equal(parsed.venv.enabled.get(), false);
+    assert.equal(parsed.venv.path.get(), '~/.ppt-master/venv');
+    assert.equal(parsed.venv.oldPathPolicy.get(), 'keep', 'union+const 枚举经默认值校验');
+
+    // 层③：toJSON() 返回 {uid, refs} 引用图；顶层无 dict；volatile 叶恰 3 且各带 meta.volatile
+    const json = schema.toJSON();
+    assert.deepEqual(Object.keys(json).sort(), ['refs', 'uid'], '顶层只有 {uid, refs}');
+    assert.equal(json.refs[json.uid].dict !== undefined, true, '叶在 refs 内（顶层无属性对象）');
+    const refs = Object.values(json.refs);
+    const volatileRefs = refs.filter((node) => node.meta?.volatile === true);
+    assert.equal(volatileRefs.length, 3, 'volatile 叶恰 3（三字段；多于 3 = 替身失真）');
+    assert.ok(
+      refs.some((node) => node.meta?.volatile !== true),
+      '须另含 ≥1 非 volatile 叶（否则 volatile 检查自我印证）',
+    );
+    // Task 10（携入自 Task 5 审查）：把「非 volatile 叶」收紧到**真正的叶**——容器节点
+    // （root/venv object）恒非 volatile，只断言"存在非 volatile 节点"会被容器满足，
+    // 替身若把所有叶子都标 volatile 仍能自我印证。真实 Config 的非 volatile 叶＝
+    // oldPathPolicy 联合型的两个 const 子节点（本机实测）。
+    assert.ok(
+      refs.some((node) => node.meta?.volatile !== true && node.dict === undefined && node.list === undefined),
+      '须另含 ≥1 非 volatile **叶**（容器节点不算；否则 volatile 检查自我印证）',
+    );
+    assert.deepEqual(
+      volatileRefs.map((node) => node.meta.description).sort(),
+      ['enabled', 'path', 'policy'],
+      'volatile 叶即三字段本身',
+    );
+
+    // 层②/④：二次 .volatile() 抛 TypeError（真实实测文案）
+    assert.throws(
+      () => z.boolean().default(false).volatile().volatile(),
+      (error) => {
+        assert.equal(error.constructor, TypeError);
+        assert.match(error.message, /volatile schema is already wrapped/);
+        return true;
+      },
+    );
+  } finally {
+    await sdk.cleanup();
+  }
+});
+
+// ─── runCompatCheck：stub SDK 驱动主流程全分支 ───────────────────
+
+test('runCompatCheck 基线: stub SDK 全绿——三真实工具过 register、provider 读回、rank 关系、无漂移', async () => {
+  const [sdk, fixture] = await Promise.all([makeStubSdk(), makePositiveFixture()]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.deepEqual(result.problems, [], `基线不得有问题项: ${result.problems.join(' | ')}`);
+    assert.deepEqual(result.warnings, [], `基线不得有警告项: ${result.warnings.join(' | ')}`);
+    assert.equal(result.resolved.via, 'explicit');
+    assert.equal(result.entry, PLUGIN_ENTRY);
+
+    // createTools() 真实三工具产物确实经过了（stub）ToolRuntime.register
+    const toolsStub = await stubModule(sdk.modules, '@deepseek-ai/dsh-tools');
+    for (const toolName of ['ppt_master_info', 'ppt_master_check_env', 'ppt_master_setup_deps']) {
+      assert.ok(
+        toolsStub.registerLog.includes(toolName),
+        `${toolName} 须经 register（实际: ${toolsStub.registerLog.join(',')}）`,
+      );
+    }
+    // provider 经（stub）SkillRegistry 挂载并读回 fixture 的 alpha
+    const skillStub = await stubModule(sdk.modules, '@deepseek-ai/dsh-skill');
+    assert.ok(
+      skillStub.skillLog.some((names) => names.includes('alpha')),
+      `registry list() 读回须含注入根的 alpha（实际: ${JSON.stringify(skillStub.skillLog)}）`,
+    );
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck 基线: 方法形态绑定——stub 拒绝脱挂调用，index.js 须以方法形态驱动 registerProvider/register', async () => {
+  // stub 的 registerProvider/register 在 this 非实例时 throw（复刻 cordis traceable
+  // 层契约：提取成变量再调用 → this=undefined → TypeError）。当前 index.js 若以提取
+  // 式调用驱动，apply 即抛 → problems 非空；方法形态则全绿。本用例即该回归的守卫。
+  const [sdk, fixture] = await Promise.all([makeStubSdk(), makePositiveFixture()]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.deepEqual(result.problems, [], `方法形态调用须全绿: ${result.problems.join(' | ')}`);
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: 注入通道——skillRoots 指向 fixture 正例子集（无 broken），经 apply(ctx,{skillRoots}) 驱动', async () => {
+  const [sdk, fixture] = await makeStubSdk().then(async (sdk_) => [sdk_, await makePositiveFixture()]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.deepEqual(result.problems, []);
+    assert.ok(result.notes.some((note) => /alpha/.test(note)), 'notes 记录读回的 skill 名（证明注入根生效）');
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: rank 相对关系失败——stub BUNDLED_SKILL_RANK=500 < 本插件 550 → problems', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ bundledRank: 500, superpowersRank: 550 }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.equal(someProblem(result, /rank|BUNDLED/), true, '相对关系失败必须落入 problems');
+    assert.ok(result.problems.length > 0, 'problems 非空 → CLI 非零退出');
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: SDK 未导出数字型 BUNDLED_SKILL_RANK → problems（fail-loud）', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ omitBundledRankExport: true }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.equal(someProblem(result, /BUNDLED_SKILL_RANK/), true);
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck 漂移: 注入期望 rank=550 + stub superpowers-dsh 常量 600 → 告警且非零退出', async () => {
+  assert.equal(SKILL_RANK, 550, '本插件 SKILL_RANK 当前为 550（漂移语义锚点）');
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ superpowersRank: 600 }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+      expectedRank: 550, // 注入期望常量（deps 模式）
+    });
+    assert.equal(someProblem(result, /漂移|superpowers-dsh/), true, '漂移必须落入 problems（非零退出）');
+    assert.equal(someProblem(result, /600/), true, '问题项指明实际常量 600');
+    assert.equal(someProblem(result, /550/), true, '问题项指明期望 550');
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck 漂移: 期望 600 与 stub 常量 600 一致 → 无漂移项', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ superpowersRank: 600 }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+      expectedRank: 600,
+    });
+    assert.equal(someProblem(result, /漂移/), false, '一致时不得报漂移');
+    // rank 相对关系仍按真实 SKILL_RANK 语义？——不：expectedRank 同时驱动两项，
+    // 600<600 不成立 → rank 关系项应在。此处只断言无漂移。
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: superpowers-dsh 包缺失 → warning 降级该项，不判失败', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ superpowers: 'absent' }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.deepEqual(result.problems, [], '读不到 superpowers-dsh 不判失败（跟随策略观测项）');
+    assert.equal(someWarning(result, /superpowers-dsh/), true, '降级记入 warnings');
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: superpowers-dsh 存在但常量不可解析 → warning 降级', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ superpowers: 'no-const' }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.deepEqual(result.problems, []);
+    assert.equal(someWarning(result, /PACKAGED_SKILL_RANK|superpowers-dsh/), true);
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: register 拒绝手写定义 → §3.5 回退 defineTool 重验并报告（problems 非空）', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ rejectBareTools: true }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.equal(someProblem(result, /register|拒绝/), true, '拒绝必须落入 problems（当前插件形态对该 SDK 不兼容）');
+    assert.equal(someProblem(result, /defineTool/), true, '报告 §3.5 回退验证结果');
+    assert.equal(someProblem(result, /peerDependency/), true, '报告须指出 peerDependency 补救');
+    const toolsStub = await stubModule(sdk.modules, '@deepseek-ai/dsh-tools');
+    assert.equal(toolsStub.defineLog.length > 0, true, '回退确实以 defineTool 重建了定义');
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: SDK 包缺失（stub 不含 dsh-skill）→ problems 指名该包', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ omit: ['@deepseek-ai/dsh-skill'] }),
+    makePositiveFixture(),
+  ]);
+  try {
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [fixture.root],
+      env: {},
+    });
+    assert.equal(someProblem(result, /dsh-skill/), true);
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('runCompatCheck: provider fail-loud 透传——注入含 broken 的根 → problems 不静默', async () => {
+  const tree = await makeTree('compat-broken-');
+  const sdk = await makeStubSdk();
+  try {
+    const root = join(tree.base, 'skills');
+    await cp(join(skillsFixtureRoot, 'broken'), join(root, 'broken'), { recursive: true });
+    const result = await runCompatCheck({
+      dshModules: sdk.modules,
+      skillRoots: [root],
+      env: {},
+    });
+    assert.equal(result.problems.length > 0, true, 'provider fail-loud 必须转为 problems');
+    assert.equal(someProblem(result, /broken|description/), true);
+  } finally {
+    await Promise.all([tree.cleanup(), sdk.cleanup()]);
+  }
+});
+
+// ─── §7.7 五项设计成立性前置检查（Task 10）─────────────────────
+
+test('runCompatCheck §7.7 五项: ns.Config volatile(恰 3 + 另含非 volatile 叶)/默认值交叉锚定/apply 第二参/bundle insert 静态/受控解析通道/生产根入口读回', async () => {
+  const sdk = await makeStubSdk();
+  try {
+    // 无 skillRoots（toolOptions 缺省）→ 生产包内根形态：决策A 下合成入口技能在场。
+    const result = await runCompatCheck({ dshModules: sdk.modules, env: {} });
+    assert.deepEqual(result.problems, [], `§7.7 五项须全绿: ${result.problems.join(' | ')}`);
+    assert.deepEqual(result.warnings, []);
+
+    const joined = result.notes.join('\n');
+    for (const marker of ['§7.7①', '§7.7②', '§7.7③', '§7.7④', '§7.7⑤', '§7.7⑦']) {
+      assert.ok(
+        result.notes.some((note) => note.includes(marker)),
+        `compat 输出缺 ${marker} 断言行（实际 notes:\n${joined}）`,
+      );
+    }
+    // ① 遍历口径与计数落在断言行内：volatile 恰 5（venv 三 + scope 两）**且**另含非
+    // volatile 叶（防自我印证）。
+    assert.match(joined, /§7.7①[^\n]*volatile[^\n]*5/);
+    assert.match(joined, /§7.7①[^\n]*非 volatile 叶/);
+    // 默认值交叉锚定（携入自 Task 5 审查）：schema 校验默认值 ≡ 注入袋缺省默认值
+    assert.ok(
+      result.notes.some((note) => note.includes('默认值交叉锚定')),
+      `缺默认值交叉锚定断言行（实际 notes:\n${joined}）`,
+    );
+    // ② apply 第二参注入通道实跑（显式根经第二参生效）
+    assert.match(joined, /§7.7②[^\n]*apply/);
+    // ⑤ 生产根形态：入口技能经真实 SkillRegistry 在场、可 get()、content 非空
+    const entryNote = result.notes.find((note) => note.includes('§7.7⑤'));
+    assert.match(entryNote, /ppt-master-env/);
+    assert.match(entryNote, /content 非空/);
+  } finally {
+    await sdk.cleanup();
+  }
+});
+
+// ─── CLI ─────────────────────────────────────────────────────────
+
+test('CLI: --dsh-modules stub --skill-roots fixture → exit 0 且输出 OK', async () => {
+  const [sdk, fixture] = await Promise.all([makeStubSdk(), makePositiveFixture()]);
+  try {
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [scriptPath, '--dsh-modules', sdk.modules, '--skill-roots', fixture.root],
+      { env: stubLoadEnv(sdk) },
+    );
+    assert.match(stdout, /OK/);
+    assert.match(stdout, /alpha/);
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('CLI: 漂移（stub superpowers-dsh 常量 600，期望默认 550）→ exit 1 且列漂移', async () => {
+  const [sdk, fixture] = await Promise.all([
+    makeStubSdk({ superpowersRank: 600 }),
+    makePositiveFixture(),
+  ]);
+  try {
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        [scriptPath, '--dsh-modules', sdk.modules, '--skill-roots', fixture.root],
+        { env: stubLoadEnv(sdk) },
+      ),
+      (error) => {
+        assert.equal(error.code, 1, '漂移 → 非零退出');
+        assert.match(error.stdout, /漂移/);
+        return true;
+      },
+    );
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('CLI: 无 --dsh-modules 且 env 无定位线索 → exit 1 报无法定位', async () => {
+  const fixture = await makePositiveFixture();
+  try {
+    await assert.rejects(
+      execFileAsync(process.execPath, [scriptPath, '--skill-roots', fixture.root], { env: {} }),
+      (error) => {
+        assert.equal(error.code, 1);
+        assert.match(error.stdout, /无法定位|DSH_HOME/);
+        return true;
+      },
+    );
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test('CLI: --skill-roots 逗号多根 → 两根的 skill 均读回', async () => {
+  const [sdk, fixture] = await Promise.all([makeStubSdk(), makePositiveFixture()]);
+  const tree = await makeTree('compat-second-');
+  try {
+    const secondRoot = join(tree.base, 'more-skills');
+    await mkdir(join(secondRoot, 'second-skill'), { recursive: true });
+    await writeFile(
+      join(secondRoot, 'second-skill', 'SKILL.md'),
+      '---\nname: second-skill\ndescription: second root skill\n---\n\nbody\n',
+    );
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [
+        scriptPath,
+        '--dsh-modules', sdk.modules,
+        '--skill-roots', `${fixture.root},${secondRoot}`,
+      ],
+      { env: stubLoadEnv(sdk) },
+    );
+    assert.match(stdout, /OK/);
+    assert.match(stdout, /alpha/);
+    assert.match(stdout, /second-skill/);
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup(), tree.cleanup()]);
+  }
+});
+
+test('CLI: 未知参数 → exit 1 usage 提示', async () => {
+  await assert.rejects(
+    execFileAsync(process.execPath, [scriptPath, '--bogus'], { env: {} }),
+    (error) => {
+      assert.equal(error.code, 1);
+      assert.match(error.stdout + error.stderr, /用法|unknown|未知/);
+      return true;
+    },
+  );
+});
+
+test('T5⑧: schemastery 两态——可解析（注入 stub env）→ 装载成功；不可解析（env 清空 + --dsh-modules）→ fail-loud 命中包名且非零退出', async () => {
+  const [sdk, fixture] = await Promise.all([makeStubSdk(), makePositiveFixture()]);
+  try {
+    const argv = [scriptPath, '--dsh-modules', sdk.modules, '--skill-roots', fixture.root];
+
+    // 可解析态：DSH_NODE_MODULES=<stub 树>/node_modules（含 schemastery 替身）→ 装载成功
+    const { stdout } = await execFileAsync(process.execPath, argv, { env: stubLoadEnv(sdk) });
+    assert.match(stdout, /OK/, '可解析态：插件入口装载成功且契约全绿');
+
+    // 不可解析态：清空 DSH_*（env:{}）＋仍传 --dsh-modules（越过 CLI 定位级，否则先以
+    // 「无法定位」退出）→ 装载期 fail-loud。唯一正向标记＝错误消息含包名。
+    await assert.rejects(
+      execFileAsync(process.execPath, argv, { env: {} }),
+      (error) => {
+        assert.notEqual(error.code, 0, '装载期 fail-loud → 非零退出');
+        assert.match(
+          `${error.stdout ?? ''}${error.stderr ?? ''}`,
+          /@deepseek-ai\/schemastery/,
+          'fail-loud 必须点名不可解析的宿主包（唯一正向标记）',
+        );
+        return true;
+      },
+    );
+  } finally {
+    await Promise.all([sdk.cleanup(), fixture.cleanup()]);
+  }
+});
+
+test('G3-08: 相对 DSH_NODE_MODULES 命中 → 锚点先 resolve（不抛裸 ERR_INVALID_ARG_VALUE；诊断含包名）', async () => {
+  const sdk = await makeStubSdk();
+  const emptyTree = await mkdtemp(join(tmpdir(), 'compat-rel-empty-'));
+  await mkdir(join(emptyTree, 'node_modules'), { recursive: true });
+  // 装载探针：只做"动态 import 插件入口"这一件事，故观测面与 CLI 无关。
+  const loadProbe = `await import(${JSON.stringify(pathToFileURL(PLUGIN_ENTRY).href)}); console.log('PLUGIN-LOADED');`;
+  const runProbe = (cwd) =>
+    execFileAsync(process.execPath, ['--input-type=module', '-e', loadProbe], {
+      cwd,
+      // 相对拼写：`locateDshModules()` 的 isDirectory 以 cwd 为基命中，但 createRequire 的锚点
+      // 曾是 `join('node_modules','noop-anchor.cjs')` 这类**相对路径** → 裸 TypeError。
+      env: { DSH_NODE_MODULES: 'node_modules' },
+    });
+  try {
+    // 形态一（正向）：相对命中且包可解析 → 锚点解析为绝对路径后照常装载。
+    const { stdout } = await runProbe(sdk.base);
+    assert.match(stdout, /PLUGIN-LOADED/, '相对 DSH_NODE_MODULES 命中应可装载（锚点须为绝对路径）');
+
+    // 形态二（负向）：相对命中但包不可解析 → 必须仍是"点名宿主包"的可诊断 fail-loud，
+    // 而不是不含包名的 createRequire 参数错误（compat 不可解析态用例的唯一正向标记）。
+    await assert.rejects(
+      runProbe(emptyTree),
+      (error) => {
+        assert.notEqual(error.code, 0, '装载期 fail-loud → 非零退出');
+        assert.match(
+          `${error.stdout ?? ''}${error.stderr ?? ''}`,
+          /@deepseek-ai\/schemastery/,
+          '相对命中且不可解析时，诊断仍须点名宿主包',
+        );
+        return true;
+      },
+    );
+  } finally {
+    await Promise.all([sdk.cleanup(), rm(emptyTree, { recursive: true, force: true })]);
+  }
+});
+
+test('CLI: §7.7 五项断言行（无 --skill-roots → 生产根形态）→ exit 0 且 stdout 五项齐', async () => {
+  const sdk = await makeStubSdk();
+  try {
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [scriptPath, '--dsh-modules', sdk.modules],
+      { env: stubLoadEnv(sdk) },
+    );
+    for (const marker of ['§7.7①', '§7.7②', '§7.7③', '§7.7④', '§7.7⑤', '§7.7⑦']) {
+      assert.ok(stdout.includes(marker), `CLI stdout 缺 ${marker} 断言行（实际 stdout:\n${stdout}）`);
+    }
+    assert.match(stdout, /OK/);
+  } finally {
+    await sdk.cleanup();
+  }
+});
